@@ -4,6 +4,7 @@ Tests for TranscribeOne
 Run with: python -m pytest test_transcribeone.py -v
 """
 
+import json
 import os
 import sys
 import types
@@ -12,6 +13,215 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import transcribeone
+
+
+# ---------------------------------------------------------------------------
+# set_api_key (core)
+# ---------------------------------------------------------------------------
+
+class TestSetApiKey:
+    """Tests for set_api_key()."""
+
+    def test_sets_api_key(self):
+        """Valid key is stored in aai.settings.api_key."""
+        import assemblyai as aai
+        transcribeone.set_api_key("my-key-123")
+        assert aai.settings.api_key == "my-key-123"
+
+    def test_empty_key_raises(self):
+        """Empty string raises ValueError."""
+        with pytest.raises(ValueError, match="empty"):
+            transcribeone.set_api_key("")
+
+    def test_falsy_key_raises(self):
+        """None-ish value raises ValueError."""
+        with pytest.raises(ValueError, match="empty"):
+            transcribeone.set_api_key("")
+
+
+# ---------------------------------------------------------------------------
+# validate_audio_file (core)
+# ---------------------------------------------------------------------------
+
+class TestValidateAudioFile:
+    """Tests for validate_audio_file()."""
+
+    def test_valid_mp3(self, tmp_path):
+        """Valid mp3 file passes validation."""
+        f = tmp_path / "test.mp3"
+        f.write_text("data")
+        transcribeone.validate_audio_file(str(f))
+
+    def test_missing_file_raises(self):
+        """Missing file raises ValueError."""
+        with pytest.raises(ValueError, match="File not found"):
+            transcribeone.validate_audio_file("/no/such/file.mp3")
+
+    def test_directory_raises(self, tmp_path):
+        """Directory path raises ValueError."""
+        with pytest.raises(ValueError, match="Not a file"):
+            transcribeone.validate_audio_file(str(tmp_path))
+
+    def test_permission_denied_raises(self, tmp_path):
+        """Unreadable file raises ValueError."""
+        f = tmp_path / "secret.mp3"
+        f.write_text("data")
+        f.chmod(0o000)
+        try:
+            with pytest.raises(ValueError, match="Permission denied"):
+                transcribeone.validate_audio_file(str(f))
+        finally:
+            f.chmod(0o644)
+
+    def test_empty_file_raises(self, tmp_path):
+        """Zero-byte file raises ValueError."""
+        f = tmp_path / "empty.mp3"
+        f.write_text("")
+        with pytest.raises(ValueError, match="File is empty"):
+            transcribeone.validate_audio_file(str(f))
+
+    def test_unsupported_format_raises(self, tmp_path):
+        """Unsupported extension raises ValueError."""
+        f = tmp_path / "doc.pdf"
+        f.write_text("data")
+        with pytest.raises(ValueError, match="Unsupported audio format"):
+            transcribeone.validate_audio_file(str(f))
+
+    @pytest.mark.parametrize("ext", transcribeone.SUPPORTED_FORMATS)
+    def test_all_supported_formats(self, tmp_path, ext):
+        """All documented formats pass validation."""
+        f = tmp_path / f"test{ext}"
+        f.write_text("data")
+        transcribeone.validate_audio_file(str(f))
+
+
+# ---------------------------------------------------------------------------
+# run_transcription (core)
+# ---------------------------------------------------------------------------
+
+class TestRunTranscription:
+    """Tests for run_transcription()."""
+
+    def _make_utterance(self, speaker: str, text: str) -> MagicMock:
+        u = MagicMock()
+        u.speaker = speaker
+        u.text = text
+        return u
+
+    def test_returns_id_and_tuples(self):
+        """Successful transcription returns (id, [(speaker, text)])."""
+        mock_transcript = MagicMock()
+        mock_transcript.status = "completed"
+        mock_transcript.id = "test-id-123"
+        mock_transcript.utterances = [
+            self._make_utterance("A", "Hello."),
+            self._make_utterance("B", "Hi."),
+        ]
+
+        with patch("transcribeone.aai.Transcriber") as MockT:
+            MockT.return_value.transcribe.return_value = mock_transcript
+            tid, results = transcribeone.run_transcription("test.mp3")
+
+        assert tid == "test-id-123"
+        assert results == [("A", "Hello."), ("B", "Hi.")]
+
+    def test_no_speech_returns_empty(self):
+        """Empty utterances returns (id, [])."""
+        mock_transcript = MagicMock()
+        mock_transcript.status = "completed"
+        mock_transcript.id = "test-id"
+        mock_transcript.utterances = []
+
+        with patch("transcribeone.aai.Transcriber") as MockT:
+            MockT.return_value.transcribe.return_value = mock_transcript
+            tid, results = transcribeone.run_transcription("test.mp3")
+
+        assert tid == "test-id"
+        assert results == []
+
+    def test_error_raises_transcribe_error(self):
+        """API error raises TranscribeError."""
+        import assemblyai as aai
+
+        mock_transcript = MagicMock()
+        mock_transcript.status = aai.TranscriptStatus.error
+        mock_transcript.error = "Bad request"
+
+        with patch("transcribeone.aai.Transcriber") as MockT:
+            MockT.return_value.transcribe.return_value = mock_transcript
+            with pytest.raises(transcribeone.TranscribeError, match="Bad request"):
+                transcribeone.run_transcription("test.mp3")
+
+
+# ---------------------------------------------------------------------------
+# identify_speakers (core)
+# ---------------------------------------------------------------------------
+
+class TestIdentifySpeakers:
+    """Tests for identify_speakers()."""
+
+    def test_successful_identification(self):
+        """Returns identified speaker tuples on success."""
+        response_body = json.dumps({
+            "speech_understanding": {
+                "response": {
+                    "speaker_identification": {
+                        "utterances": [
+                            {"speaker": "Alice", "text": "Hello."},
+                            {"speaker": "Bob", "text": "Hi there."},
+                        ]
+                    }
+                }
+            }
+        }).encode()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_body
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("transcribeone.urlopen", return_value=mock_resp):
+            result = transcribeone.identify_speakers("tid-123", "key-456")
+
+        assert result == [("Alice", "Hello."), ("Bob", "Hi there.")]
+
+    def test_api_error_returns_empty(self):
+        """Returns empty list on HTTP error."""
+        from urllib.error import HTTPError
+
+        with patch("transcribeone.urlopen", side_effect=HTTPError(None, 500, "err", {}, None)):
+            result = transcribeone.identify_speakers("tid", "key")
+
+        assert result == []
+
+    def test_malformed_response_returns_empty(self):
+        """Returns empty list on unexpected response structure."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"unexpected": "data"}'
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("transcribeone.urlopen", return_value=mock_resp):
+            result = transcribeone.identify_speakers("tid", "key")
+
+        assert result == []
+
+    def test_known_values_included_in_request(self):
+        """known_values are passed through to the API payload."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"speech_understanding":{"response":{"speaker_identification":{"utterances":[]}}}}'
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("transcribeone.urlopen", return_value=mock_resp) as mock_urlopen:
+            transcribeone.identify_speakers("tid", "key", "role", ["Host", "Guest"])
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        payload = json.loads(req.data.decode())
+        si = payload["speech_understanding"]["request"]["speaker_identification"]
+        assert si["speaker_type"] == "role"
+        assert si["known_values"] == ["Host", "Guest"]
 
 
 # ---------------------------------------------------------------------------

@@ -7,10 +7,129 @@ Simple CLI tool for transcribing audio files using AssemblyAI,
 with speaker labeling enabled.
 """
 
+import json
 import os
 import sys
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
 import assemblyai as aai
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SUPPORTED_FORMATS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma", ".webm")
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class TranscribeError(Exception):
+    """Raised when transcription fails."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Core functions (reusable from CLI and GUI)
+# ---------------------------------------------------------------------------
+
+def set_api_key(api_key: str) -> None:
+    """Set the AssemblyAI API key. Raises ValueError if empty."""
+    if not api_key:
+        raise ValueError("API key cannot be empty.")
+    aai.settings.api_key = api_key
+
+
+def validate_audio_file(audio_file: str) -> None:
+    """Validate that the audio file exists, is readable, non-empty, and a supported format.
+
+    Raises ValueError with a user-friendly message on failure.
+    """
+    if not os.path.exists(audio_file):
+        raise ValueError(f"File not found: {audio_file}")
+    if not os.path.isfile(audio_file):
+        raise ValueError(f"Not a file: {audio_file}")
+    if not os.access(audio_file, os.R_OK):
+        raise ValueError(f"Permission denied: {audio_file}")
+    if os.path.getsize(audio_file) == 0:
+        raise ValueError(f"File is empty: {audio_file}")
+    if not audio_file.lower().endswith(SUPPORTED_FORMATS):
+        raise ValueError(
+            f"Unsupported audio format: {audio_file}\n"
+            f"Supported formats: {', '.join(SUPPORTED_FORMATS)}"
+        )
+
+
+def run_transcription(audio_file: str) -> tuple[str, list[tuple[str, str]]]:
+    """Transcribe audio and return (transcript_id, [(speaker, text), ...]).
+
+    Raises TranscribeError on API failure.
+    """
+    config = aai.TranscriptionConfig(speaker_labels=True)
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(audio_file, config)
+
+    if transcript.status == aai.TranscriptStatus.error:
+        raise TranscribeError(f"Transcription failed: {transcript.error}")
+
+    if not transcript.utterances:
+        return (transcript.id, [])
+
+    results = [(u.speaker, u.text) for u in transcript.utterances]
+    return (transcript.id, results)
+
+
+def identify_speakers(
+    transcript_id: str,
+    api_key: str,
+    speaker_type: str = "name",
+    known_values: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Call the Speech Understanding API to identify speakers.
+
+    Returns [(speaker_name, text), ...] with real names/roles instead of
+    generic labels like 'A', 'B'.  Returns an empty list on failure so
+    callers can fall back to the original labels.
+    """
+    url = "https://llm-gateway.assemblyai.com/v1/understanding"
+
+    speaker_id_config: dict = {"speaker_type": speaker_type}
+    if known_values:
+        speaker_id_config["known_values"] = known_values
+
+    payload = {
+        "transcript_id": transcript_id,
+        "speech_understanding": {
+            "request": {
+                "speaker_identification": speaker_id_config,
+            }
+        },
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=data, method="POST")
+    req.add_header("Authorization", api_key)
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (URLError, HTTPError, json.JSONDecodeError):
+        return []
+
+    try:
+        utterances = body["speech_understanding"]["response"]["speaker_identification"]["utterances"]
+        return [(u["speaker"], u["text"]) for u in utterances]
+    except (KeyError, TypeError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# CLI functions
+# ---------------------------------------------------------------------------
 
 def load_api_key() -> None:
     """
@@ -34,26 +153,10 @@ def parse_args() -> str:
 
     audio_file = sys.argv[1]
 
-    if not os.path.exists(audio_file):
-        print(f"Error: File not found: {audio_file}", file=sys.stderr)
-        sys.exit(1)
-
-    if not os.path.isfile(audio_file):
-        print(f"Error: Not a file: {audio_file}", file=sys.stderr)
-        sys.exit(1)
-
-    if not os.access(audio_file, os.R_OK):
-        print(f"Error: Permission denied: {audio_file}", file=sys.stderr)
-        sys.exit(1)
-
-    if os.path.getsize(audio_file) == 0:
-        print(f"Error: File is empty: {audio_file}", file=sys.stderr)
-        sys.exit(1)
-
-    supported = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma", ".webm")
-    if not audio_file.lower().endswith(supported):
-        print(f"Error: Unsupported audio format: {audio_file}", file=sys.stderr)
-        print(f"Supported formats: {', '.join(supported)}", file=sys.stderr)
+    try:
+        validate_audio_file(audio_file)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     return audio_file

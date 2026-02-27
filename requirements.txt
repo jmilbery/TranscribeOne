@@ -1,0 +1,4 @@
+assemblyai>=0.20.0
+tkinterdnd2>=0.3.0
+pygame>=2.5.0
+pyinstaller>=6.0.0
