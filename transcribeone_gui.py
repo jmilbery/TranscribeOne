@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -43,7 +44,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 KEYCHAIN_SERVICE = "TranscribeOne"
 KEYCHAIN_ACCOUNT = "api_key"
 WINDOW_WIDTH = 720
-WINDOW_HEIGHT = 860
+WINDOW_HEIGHT = 1000
 AUDIO_FILETYPES = [
     ("Audio files", " ".join(f"*{ext}" for ext in transcribeone.SUPPORTED_FORMATS)),
     ("All files", "*.*"),
@@ -67,6 +68,12 @@ CLR_TEXT = "#1d1d1f"           # Primary text
 CLR_TEXT_SEC = "#86868b"       # Secondary text
 CLR_SUCCESS = "#34c759"        # Success green
 CLR_HEADER = "#1d1d1f"        # Section header text
+CLR_BTN_BG = "#e8e8ed"        # Button background
+CLR_BTN_FG = "#1d1d1f"        # Button foreground
+CLR_BTN_ACTIVE = "#d1d1d6"    # Button active/pressed
+CLR_BTN_ACC_BG = "#0071e3"    # Accent button bg
+CLR_BTN_ACC_FG = "#ffffff"    # Accent button fg
+CLR_BTN_ACC_ACTIVE = "#005bb5" # Accent button active
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +209,7 @@ class TranscribeOneApp:
         self._current_audio_file: str = ""
         self._raw_results: list[tuple[str, str]] = []
         self._speaker_name_vars: dict[str, tk.StringVar] = {}
-        self._drop_just_occurred = False
+        self._last_drop_time = 0.0
 
         self._setup_styles()
         self._build_ui()
@@ -210,10 +217,9 @@ class TranscribeOneApp:
         self._setup_mac_open_document()
         self._load_preferences()
 
-        # Fix macOS tkinter focus issue: without this, the first click on
-        # a widget only moves focus away from the previously focused widget
-        # and a *second* click is needed to actually activate the target.
-        self.root.bind_all("<Button-1>", self._on_global_click)
+        # Note: we previously used bind_all("<Button-1>") to fix macOS
+        # focus issues, but it interfered with tk.Button click delivery
+        # and caused spurious browse dialogs after drag-and-drop.  Removed.
 
     # ------------------------------------------------------------------
     # Styling
@@ -247,15 +253,45 @@ class TranscribeOneApp:
         style.configure("Card.TLabel", background=CLR_SECTION_BG, foreground=CLR_TEXT)
         style.configure("CardMuted.TLabel", background=CLR_SECTION_BG, foreground=CLR_TEXT_SEC)
 
-        # Accent button (Transcribe)
-        style.configure(
-            "Accent.TButton",
-            font=("SF Pro Text", 13, "bold"),
-        )
-
         # Status bar
         style.configure("Status.TLabel", background=CLR_BG, foreground=CLR_TEXT_SEC)
         style.configure("Status.TFrame", background=CLR_BG)
+
+    # ------------------------------------------------------------------
+    # Button factory (uses tk.Button for reliable macOS click handling)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_button(parent, text: str, command, accent: bool = False,
+                     width: int = 0, **kwargs) -> tk.Button:
+        """Create a styled tk.Button.
+
+        ttk.Button with the macOS aqua theme has unreliable mouse-click
+        handling — clicks are often swallowed by focus changes.  Plain
+        tk.Button does not have this problem.
+        """
+        opts: dict = {
+            "text": text,
+            "command": command,
+            "font": ("SF Pro Text", 12),
+            "relief": "raised",
+            "bd": 1,
+            "padx": 10,
+            "pady": 3,
+        }
+        if accent:
+            opts.update(bg=CLR_BTN_ACC_BG, fg=CLR_BTN_ACC_FG,
+                        activebackground=CLR_BTN_ACC_ACTIVE,
+                        activeforeground=CLR_BTN_ACC_FG,
+                        font=("SF Pro Text", 13, "bold"))
+        else:
+            opts.update(bg=CLR_BTN_BG, fg=CLR_BTN_FG,
+                        activebackground=CLR_BTN_ACTIVE,
+                        activeforeground=CLR_BTN_FG)
+        if width:
+            opts["width"] = width
+        opts.update(kwargs)
+        return tk.Button(parent, **opts)
 
     # ------------------------------------------------------------------
     # UI construction helpers
@@ -269,7 +305,7 @@ class TranscribeOneApp:
         """
         # Outer wrapper provides the rounded-corner card look
         outer = tk.Frame(parent, bg=CLR_SECTION_BD, bd=0, highlightthickness=0)
-        pack_opts = {"fill": "x", "padx": 14, "pady": 5}
+        pack_opts = {"fill": "x", "padx": 14, "pady": 3}
         pack_opts.update(pack_kwargs)
         outer.pack(**pack_opts)
 
@@ -278,14 +314,14 @@ class TranscribeOneApp:
 
         # Header row with icon + title
         header = ttk.Frame(inner, style="Card.TFrame")
-        header.pack(fill="x", padx=10, pady=(10, 4))
+        header.pack(fill="x", padx=10, pady=(6, 2))
 
         ttk.Label(header, text=icon, style="SectionIcon.TLabel").pack(side="left", padx=(0, 6))
         ttk.Label(header, text=title, style="SectionHeader.TLabel").pack(side="left")
 
         # Content area
         content = ttk.Frame(inner, style="Card.TFrame")
-        content.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        content.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         return content
 
@@ -298,7 +334,7 @@ class TranscribeOneApp:
 
         # --- App Title Bar ---
         title_frame = tk.Frame(self.root, bg=CLR_BG)
-        title_frame.pack(fill="x", padx=14, pady=(12, 4))
+        title_frame.pack(fill="x", padx=14, pady=(8, 2))
 
         title_lbl = tk.Label(
             title_frame, text="TranscribeOne",
@@ -323,7 +359,7 @@ class TranscribeOneApp:
         self._api_key_entry = ttk.Entry(key_row, textvariable=self._api_key_var, show="*", width=48)
         self._api_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        self._toggle_btn = ttk.Button(key_row, text="Show", width=6, command=self._toggle_api_key_visibility)
+        self._toggle_btn = self._make_button(key_row, text="Show", command=self._toggle_api_key_visibility, width=6)
         self._toggle_btn.pack(side="left", padx=(0, 6))
 
         ttk.Checkbutton(key_row, text="Remember", variable=self._remember_key_var).pack(side="left")
@@ -336,7 +372,7 @@ class TranscribeOneApp:
         # Drop zone
         self._drop_frame = tk.Frame(
             file_content, bg=CLR_DROP_BG, relief="flat", bd=0,
-            highlightbackground=CLR_DROP_BD, highlightthickness=2, height=70,
+            highlightbackground=CLR_DROP_BD, highlightthickness=2, height=50,
         )
         self._drop_frame.pack(fill="x", pady=(0, 6))
         self._drop_frame.pack_propagate(False)
@@ -362,7 +398,7 @@ class TranscribeOneApp:
         self._path_entry = ttk.Entry(path_row, textvariable=self._audio_path_var, state="readonly", takefocus=False)
         self._path_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        ttk.Button(path_row, text="Browse\u2026", command=self._browse_file).pack(side="left")
+        self._make_button(path_row, text="Browse\u2026", command=self._browse_file).pack(side="left")
 
         fmt_list = ", ".join(ext.lstrip(".") for ext in transcribeone.SUPPORTED_FORMATS)
         if HAS_FFMPEG:
@@ -383,10 +419,10 @@ class TranscribeOneApp:
         controls_row = ttk.Frame(player_content, style="Card.TFrame")
         controls_row.pack(fill="x")
 
-        self._play_btn = ttk.Button(controls_row, text="\u25B6 Play", width=8, command=self._toggle_playback)
+        self._play_btn = self._make_button(controls_row, text="\u25B6 Play", command=self._toggle_playback, width=8)
         self._play_btn.pack(side="left", padx=(0, 6))
 
-        self._stop_btn = ttk.Button(controls_row, text="\u25A0 Stop", width=8, command=self._stop_playback)
+        self._stop_btn = self._make_button(controls_row, text="\u25A0 Stop", command=self._stop_playback, width=8)
         self._stop_btn.pack(side="left", padx=(0, 12))
 
         ttk.Label(controls_row, text="Speed:", style="Card.TLabel").pack(side="left", padx=(0, 4))
@@ -429,11 +465,11 @@ class TranscribeOneApp:
 
         # --- Transcribe ---
         ctrl_frame = tk.Frame(self.root, bg=CLR_BG)
-        ctrl_frame.pack(fill="x", padx=14, pady=(6, 2))
+        ctrl_frame.pack(fill="x", padx=14, pady=(3, 1))
 
-        self._transcribe_btn = ttk.Button(
+        self._transcribe_btn = self._make_button(
             ctrl_frame, text="\u25B6  Transcribe",
-            command=self._start_transcription, style="Accent.TButton",
+            command=self._start_transcription, accent=True,
         )
         self._transcribe_btn.pack(side="right")
 
@@ -464,7 +500,7 @@ class TranscribeOneApp:
         self._rename_inner = ttk.Frame(self._rename_content, style="Card.TFrame")
         self._rename_inner.pack(fill="x")
 
-        self._apply_names_btn = ttk.Button(
+        self._apply_names_btn = self._make_button(
             self._rename_content, text="Apply Names",
             command=self._apply_speaker_names,
         )
@@ -502,10 +538,10 @@ class TranscribeOneApp:
         btn_row = ttk.Frame(self._result_frame, style="Card.TFrame")
         btn_row.pack(fill="x", pady=(6, 0))
 
-        self._copy_btn = ttk.Button(btn_row, text="Copy to Clipboard", command=self._copy_to_clipboard, state="disabled")
+        self._copy_btn = self._make_button(btn_row, text="Copy to Clipboard", command=self._copy_to_clipboard, state="disabled")
         self._copy_btn.pack(side="left", padx=(0, 6))
 
-        self._save_btn = ttk.Button(btn_row, text="Save As\u2026", command=self._save_to_file, state="disabled")
+        self._save_btn = self._make_button(btn_row, text="Save As\u2026", command=self._save_to_file, state="disabled")
         self._save_btn.pack(side="left")
 
         self._output_path_label = ttk.Label(btn_row, text="", style="CardMuted.TLabel")
@@ -541,14 +577,13 @@ class TranscribeOneApp:
 
     def _on_drop_zone_click(self, event) -> None:
         """Open file browser when the drop zone is clicked (not after a drop)."""
-        if self._drop_just_occurred:
-            self._drop_just_occurred = False
+        if time.time() - self._last_drop_time < 0.5:
             return
         self._browse_file()
 
     def _on_drop(self, event) -> None:
         """Handle file drop onto the drop zone."""
-        self._drop_just_occurred = True
+        self._last_drop_time = time.time()
         self._drop_frame.configure(bg=CLR_DROP_BG, highlightbackground=CLR_DROP_BD)
         self._drop_label.configure(bg=CLR_DROP_BG)
 
@@ -823,19 +858,6 @@ class TranscribeOneApp:
     # Actions
     # ------------------------------------------------------------------
 
-    def _on_global_click(self, event) -> None:
-        """Force focus to the clicked widget to fix macOS tkinter click issue.
-
-        On macOS, tkinter sometimes requires two clicks — the first to
-        defocus the current widget, the second to activate the target.
-        By setting focus on every ``<Button-1>`` event globally we ensure
-        the very first click reaches the intended widget.
-        """
-        try:
-            event.widget.focus_set()
-        except (AttributeError, tk.TclError):
-            pass
-
     def _toggle_api_key_visibility(self) -> None:
         """Toggle between masked and visible API key."""
         self._show_key = not self._show_key
@@ -1042,13 +1064,22 @@ class TranscribeOneApp:
         return self._format_speaker(label, identified)
 
     def _render_transcript(self, speakers_identified: bool = False) -> None:
-        """Render the transcript text using current speaker names."""
+        """Render the transcript text using current speaker names.
+
+        A blank line is inserted between consecutive lines from different
+        speakers to make the transcript easier to read.
+        """
         if not self._raw_results:
             text = "No speech detected."
         else:
-            lines = [f"{self._get_speaker_display(speaker, speakers_identified)}: {utt}"
-                     for speaker, utt in self._raw_results]
-            text = "\n".join(lines)
+            parts: list[str] = []
+            prev_speaker: str | None = None
+            for speaker, utt in self._raw_results:
+                if prev_speaker is not None and speaker != prev_speaker:
+                    parts.append("")          # blank separator line
+                parts.append(f"{self._get_speaker_display(speaker, speakers_identified)}: {utt}")
+                prev_speaker = speaker
+            text = "\n".join(parts)
 
         self._result_text.configure(state="normal")
         self._result_text.delete("1.0", "end")
