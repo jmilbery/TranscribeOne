@@ -6,6 +6,16 @@ VERSION="1.0.0"
 
 echo "=== Building ${APP_NAME} v${VERSION} ==="
 
+# Step 0: Activate venv so PyInstaller can find all dependencies
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/.venv"
+if [ -d "$VENV_DIR" ]; then
+    echo "Activating venv..."
+    source "${VENV_DIR}/bin/activate"
+else
+    echo "WARNING: No .venv found — using system Python. Packages may be missing."
+fi
+
 # Step 1: Clean previous builds
 echo "Cleaning previous builds..."
 rm -rf build/ dist/
