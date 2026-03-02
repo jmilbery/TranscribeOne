@@ -4,21 +4,11 @@ import sys
 
 block_cipher = None
 
-# Find tkinterdnd2 tkdnd data files
-tkdnd_datas = []
-try:
-    import tkinterdnd2
-    tkdnd_path = os.path.join(os.path.dirname(tkinterdnd2.__file__), "tkdnd")
-    if os.path.isdir(tkdnd_path):
-        tkdnd_datas.append((tkdnd_path, "tkinterdnd2/tkdnd"))
-except ImportError:
-    pass
-
 a = Analysis(
     ["transcribeone_gui.py"],
     pathex=[],
     binaries=[],
-    datas=tkdnd_datas,
+    datas=[],
     hiddenimports=[
         "assemblyai",
         "assemblyai.types",
@@ -33,8 +23,6 @@ a = Analysis(
         "certifi",
         "sniffio",
         "idna",
-        "tkinterdnd2",
-        "tkinterdnd2.TkinterDnD",
         "pygame",
         "pygame.mixer",
     ],

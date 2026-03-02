@@ -14,15 +14,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    HAS_DND = True
-except ImportError:
-    HAS_DND = False
 
 try:
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -61,9 +54,6 @@ CLR_ACCENT = "#0071e3"         # Primary accent (Apple blue)
 CLR_ACCENT_HOVER = "#0077ED"
 CLR_SECTION_BG = "#ffffff"     # Section card background
 CLR_SECTION_BD = "#d2d2d7"     # Section card border
-CLR_DROP_BG = "#f0f4ff"        # Drop zone background
-CLR_DROP_HOVER = "#dce6f9"     # Drop zone drag-over
-CLR_DROP_BD = "#b0c4de"        # Drop zone border
 CLR_TEXT = "#1d1d1f"           # Primary text
 CLR_TEXT_SEC = "#86868b"       # Secondary text
 CLR_SUCCESS = "#34c759"        # Success green
@@ -71,9 +61,6 @@ CLR_HEADER = "#1d1d1f"        # Section header text
 CLR_BTN_BG = "#e8e8ed"        # Button background
 CLR_BTN_FG = "#1d1d1f"        # Button foreground
 CLR_BTN_ACTIVE = "#d1d1d6"    # Button active/pressed
-CLR_BTN_ACC_BG = "#0071e3"    # Accent button bg
-CLR_BTN_ACC_FG = "#ffffff"    # Accent button fg
-CLR_BTN_ACC_ACTIVE = "#005bb5" # Accent button active
 
 
 # ---------------------------------------------------------------------------
@@ -209,17 +196,11 @@ class TranscribeOneApp:
         self._current_audio_file: str = ""
         self._raw_results: list[tuple[str, str]] = []
         self._speaker_name_vars: dict[str, tk.StringVar] = {}
-        self._last_drop_time = 0.0
 
         self._setup_styles()
         self._build_ui()
-        self._setup_dnd()
         self._setup_mac_open_document()
         self._load_preferences()
-
-        # Note: we previously used bind_all("<Button-1>") to fix macOS
-        # focus issues, but it interfered with tk.Button click delivery
-        # and caused spurious browse dialogs after drag-and-drop.  Removed.
 
     # ------------------------------------------------------------------
     # Styling
@@ -262,7 +243,7 @@ class TranscribeOneApp:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_button(parent, text: str, command, accent: bool = False,
+    def _make_button(parent, text: str, command,
                      width: int = 0, **kwargs) -> tk.Button:
         """Create a styled tk.Button.
 
@@ -278,16 +259,11 @@ class TranscribeOneApp:
             "bd": 1,
             "padx": 10,
             "pady": 3,
+            "bg": CLR_BTN_BG,
+            "fg": CLR_BTN_FG,
+            "activebackground": CLR_BTN_ACTIVE,
+            "activeforeground": CLR_BTN_FG,
         }
-        if accent:
-            opts.update(bg=CLR_BTN_ACC_BG, fg=CLR_BTN_ACC_FG,
-                        activebackground=CLR_BTN_ACC_ACTIVE,
-                        activeforeground=CLR_BTN_ACC_FG,
-                        font=("SF Pro Text", 13, "bold"))
-        else:
-            opts.update(bg=CLR_BTN_BG, fg=CLR_BTN_FG,
-                        activebackground=CLR_BTN_ACTIVE,
-                        activeforeground=CLR_BTN_FG)
         if width:
             opts["width"] = width
         opts.update(kwargs)
@@ -365,32 +341,8 @@ class TranscribeOneApp:
         ttk.Checkbutton(key_row, text="Remember", variable=self._remember_key_var).pack(side="left")
 
         # --- Source Media ---
-        # Update label based on ffmpeg availability
         media_title = "Source Media" if HAS_FFMPEG else "Audio File"
         file_content = self._create_section(self.root, "\U0001F3B5", media_title)
-
-        # Drop zone
-        self._drop_frame = tk.Frame(
-            file_content, bg=CLR_DROP_BG, relief="flat", bd=0,
-            highlightbackground=CLR_DROP_BD, highlightthickness=2, height=50,
-        )
-        self._drop_frame.pack(fill="x", pady=(0, 6))
-        self._drop_frame.pack_propagate(False)
-
-        drop_text = "Drop audio file here or click to browse" if HAS_DND else "Click to select audio file"
-        if HAS_FFMPEG:
-            drop_text = "Drop audio or video file here or click to browse" if HAS_DND else "Click to select audio or video file"
-        self._drop_label = tk.Label(
-            self._drop_frame,
-            text=drop_text,
-            bg=CLR_DROP_BG, fg=CLR_TEXT_SEC,
-            font=("SF Pro Text", 12),
-        )
-        self._drop_label.pack(expand=True)
-
-        # Make the drop zone clickable (but not when a drop just happened)
-        self._drop_frame.bind("<Button-1>", self._on_drop_zone_click)
-        self._drop_label.bind("<Button-1>", self._on_drop_zone_click)
 
         path_row = ttk.Frame(file_content, style="Card.TFrame")
         path_row.pack(fill="x")
@@ -450,6 +402,24 @@ class TranscribeOneApp:
             self._speed_combo.configure(state="disabled")
             ttk.Label(player_content, text="Audio playback unavailable (pygame not installed)", foreground="#cc0000").pack(anchor="w")
 
+        # --- Output Directory ---
+        outdir_content = self._create_section(self.root, "\U0001F4C2", "Output Directory")
+
+        outdir_row = ttk.Frame(outdir_content, style="Card.TFrame")
+        outdir_row.pack(fill="x")
+
+        self._output_dir_var = tk.StringVar()
+        self._outdir_entry = ttk.Entry(outdir_row, textvariable=self._output_dir_var, state="readonly", takefocus=False)
+        self._outdir_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self._make_button(outdir_row, text="Choose\u2026", command=self._browse_output_dir).pack(side="left")
+
+        ttk.Label(
+            outdir_content,
+            text="Transcripts auto-save here (defaults to same folder as source file)",
+            style="CardMuted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
         # --- Speaker Names ---
         names_content = self._create_section(self.root, "\U0001F465", "Speaker Names (optional)")
 
@@ -469,7 +439,8 @@ class TranscribeOneApp:
 
         self._transcribe_btn = self._make_button(
             ctrl_frame, text="\u25B6  Transcribe",
-            command=self._start_transcription, accent=True,
+            command=self._start_transcription,
+            font=("SF Pro Text", 13, "bold"),
         )
         self._transcribe_btn.pack(side="right")
 
@@ -548,71 +519,8 @@ class TranscribeOneApp:
         self._output_path_label.pack(side="right")
 
     # ------------------------------------------------------------------
-    # Drag-and-drop
+    # File handling
     # ------------------------------------------------------------------
-
-    def _setup_dnd(self) -> None:
-        """Register drag-and-drop on the drop zone if tkinterdnd2 is available."""
-        if not HAS_DND:
-            return
-
-        self._drop_frame.drop_target_register(DND_FILES)
-        self._drop_frame.dnd_bind("<<DropEnter>>", self._on_drag_enter)
-        self._drop_frame.dnd_bind("<<DropLeave>>", self._on_drag_leave)
-        self._drop_frame.dnd_bind("<<Drop>>", self._on_drop)
-
-    def _on_drag_enter(self, event) -> None:
-        """Visual feedback when dragging over the drop zone."""
-        self._drop_frame.configure(bg=CLR_DROP_HOVER, highlightbackground=CLR_ACCENT)
-        self._drop_label.configure(bg=CLR_DROP_HOVER, fg=CLR_TEXT)
-
-    def _on_drag_leave(self, event) -> None:
-        """Restore drop zone appearance when drag leaves."""
-        self._drop_frame.configure(bg=CLR_DROP_BG, highlightbackground=CLR_DROP_BD)
-        current = self._audio_path_var.get()
-        if current:
-            self._drop_label.configure(bg=CLR_DROP_BG, fg=CLR_TEXT)
-        else:
-            self._drop_label.configure(bg=CLR_DROP_BG, fg=CLR_TEXT_SEC)
-
-    def _on_drop_zone_click(self, event) -> None:
-        """Open file browser when the drop zone is clicked (not after a drop)."""
-        if time.time() - self._last_drop_time < 0.5:
-            return
-        self._browse_file()
-
-    def _on_drop(self, event) -> None:
-        """Handle file drop onto the drop zone."""
-        self._last_drop_time = time.time()
-        self._drop_frame.configure(bg=CLR_DROP_BG, highlightbackground=CLR_DROP_BD)
-        self._drop_label.configure(bg=CLR_DROP_BG)
-
-        # tkinterdnd2 wraps paths with spaces in {braces}
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            path = raw[1:-1]
-        else:
-            # Could be multiple files — take the first one
-            path = raw.split()[0] if raw else ""
-
-        if not path:
-            return
-
-        # Check for supported formats (audio + video if ffmpeg available)
-        all_formats = transcribeone.SUPPORTED_FORMATS
-        if HAS_FFMPEG:
-            all_formats = all_formats + VIDEO_FORMATS
-
-        if not path.lower().endswith(all_formats):
-            messagebox.showwarning(
-                "Unsupported File",
-                f"Please drop a supported file.\n\n"
-                f"Audio: {', '.join(transcribeone.SUPPORTED_FORMATS)}"
-                + (f"\nVideo: {', '.join(VIDEO_FORMATS)}" if HAS_FFMPEG else ""),
-            )
-            return
-
-        self._set_audio_path(path)
 
     def _setup_mac_open_document(self) -> None:
         """Handle files dragged onto the app icon in Finder/Dock."""
@@ -635,7 +543,6 @@ class TranscribeOneApp:
         """Set the audio file path and update the UI."""
         self._stop_playback()
         self._audio_path_var.set(path)
-        self._drop_label.configure(text=os.path.basename(path), fg=CLR_TEXT)
         self._loaded_audio_path = None
 
     def _is_video_file(self, path: str) -> bool:
@@ -845,10 +752,16 @@ class TranscribeOneApp:
                 if key:
                     self._api_key_var.set(key)
 
+        # Restore output directory
+        outdir = config.get("output_dir", "")
+        if outdir and os.path.isdir(outdir):
+            self._output_dir_var.set(outdir)
+
     def _save_preferences(self) -> None:
         """Persist preferences."""
         remember = self._remember_key_var.get()
-        save_config({"remember_key": remember})
+        outdir = self._output_dir_var.get().strip()
+        save_config({"remember_key": remember, "output_dir": outdir})
         if remember:
             api_key = self._api_key_var.get().strip()
             if api_key:
@@ -883,6 +796,12 @@ class TranscribeOneApp:
         )
         if path:
             self._set_audio_path(path)
+
+    def _browse_output_dir(self) -> None:
+        """Open a native directory dialog for output location."""
+        path = filedialog.askdirectory(title="Select Output Directory")
+        if path:
+            self._output_dir_var.set(path)
 
     def _cleanup_tmp_audio(self) -> None:
         """Remove any temporary audio file from a previous video conversion."""
@@ -1090,16 +1009,27 @@ class TranscribeOneApp:
         self._save_btn.configure(state="normal")
 
     def _auto_save(self) -> None:
-        """Save the current transcript text to the auto-save path."""
+        """Save the current transcript text to the auto-save path.
+
+        Uses the user-selected output directory if set, otherwise saves
+        next to the source audio file.
+        """
         if not self._current_audio_file:
             return
         text = self._result_text.get("1.0", "end-1c")
-        base = os.path.splitext(self._current_audio_file)[0]
-        output_path = f"{base}-transcript.txt"
+        basename = os.path.splitext(os.path.basename(self._current_audio_file))[0]
+        filename = f"{basename}-transcript.txt"
+
+        outdir = self._output_dir_var.get().strip()
+        if outdir:
+            output_path = os.path.join(outdir, filename)
+        else:
+            output_path = os.path.join(os.path.dirname(self._current_audio_file), filename)
+
         try:
             with open(output_path, "w") as f:
                 f.write(text + "\n")
-            self._output_path_label.configure(text=f"Saved: {os.path.basename(output_path)}")
+            self._output_path_label.configure(text=f"Saved: {output_path}")
         except OSError as exc:
             self._output_path_label.configure(text="")
             self._status_var.set(f"Done (save failed: {exc})")
@@ -1175,11 +1105,7 @@ class TranscribeOneApp:
 
 def main() -> None:
     """Launch the GUI."""
-    # Use TkinterDnD root if available for native drag-and-drop support
-    if HAS_DND:
-        root = TkinterDnD.Tk()
-    else:
-        root = tk.Tk()
+    root = tk.Tk()
 
     app = TranscribeOneApp(root)
     root.protocol("WM_DELETE_WINDOW", app._on_close)
