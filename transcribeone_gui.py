@@ -7,6 +7,7 @@ macOS desktop application for transcribing audio files with speaker
 identification using AssemblyAI.
 """
 
+import importlib.util
 import json
 import os
 import shutil
@@ -17,15 +18,23 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-try:
-    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-    import pygame
-    pygame.mixer.init()
-    HAS_AUDIO = True
-except Exception:
-    HAS_AUDIO = False
+# ---------------------------------------------------------------------------
+# Deferred imports — availability checks only
+# ---------------------------------------------------------------------------
+# Heavy libraries (pygame, assemblyai/transcribeone, anthropic) are NOT
+# imported at module level.  In a PyInstaller .app bundle on macOS,
+# Gatekeeper scans every .dylib/.so on first load, making these imports
+# take 10-30+ seconds.  Instead we use lightweight find_spec() checks
+# here and defer the actual imports to background threads / first use.
 
-import transcribeone
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+HAS_AUDIO = importlib.util.find_spec("pygame") is not None
+HAS_TRANSCRIBE = importlib.util.find_spec("transcribeone") is not None
+HAS_SHOW_NOTES = (
+    importlib.util.find_spec("anthropic") is not None
+    and importlib.util.find_spec("show_notes_processor") is not None
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,10 +45,16 @@ CONFIG_DIR = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 KEYCHAIN_SERVICE = "TranscribeOne"
 KEYCHAIN_ACCOUNT = "api_key"
+KEYCHAIN_ANTHROPIC = "anthropic_api_key"
 WINDOW_WIDTH = 720
-WINDOW_HEIGHT = 1000
+WINDOW_HEIGHT = 850
+
+# Supported audio formats (duplicated from transcribeone.py to avoid
+# importing the heavy assemblyai library at module level).
+SUPPORTED_FORMATS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma", ".webm")
+
 AUDIO_FILETYPES = [
-    ("Audio files", " ".join(f"*{ext}" for ext in transcribeone.SUPPORTED_FORMATS)),
+    ("Audio files", " ".join(f"*{ext}" for ext in SUPPORTED_FORMATS)),
     ("All files", "*.*"),
 ]
 SPEED_OPTIONS = ["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"]
@@ -57,6 +72,7 @@ CLR_SECTION_BD = "#d2d2d7"     # Section card border
 CLR_TEXT = "#1d1d1f"           # Primary text
 CLR_TEXT_SEC = "#86868b"       # Secondary text
 CLR_SUCCESS = "#34c759"        # Success green
+CLR_ERROR = "#ff3b30"          # Error red
 CLR_HEADER = "#1d1d1f"        # Section header text
 CLR_BTN_BG = "#e8e8ed"        # Button background
 CLR_BTN_FG = "#1d1d1f"        # Button foreground
@@ -112,27 +128,31 @@ def convert_video_to_audio(video_path: str, progress_callback=None) -> str:
 # Keychain helpers (macOS-specific, uses `security` CLI)
 # ---------------------------------------------------------------------------
 
-def save_to_keychain(api_key: str) -> bool:
-    """Store API key in the macOS Keychain. Returns True on success."""
+def save_to_keychain(value: str, account: str = KEYCHAIN_ACCOUNT) -> bool:
+    """Store a value in the macOS Keychain. Returns True on success.
+
+    *account* distinguishes different keys (e.g. ``"api_key"`` for
+    AssemblyAI, ``"anthropic_api_key"`` for Anthropic).
+    """
     subprocess.run(
         ["security", "delete-generic-password",
-         "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
+         "-s", KEYCHAIN_SERVICE, "-a", account],
         capture_output=True,
     )
     result = subprocess.run(
         ["security", "add-generic-password",
-         "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT,
-         "-w", api_key],
+         "-s", KEYCHAIN_SERVICE, "-a", account,
+         "-w", value],
         capture_output=True,
     )
     return result.returncode == 0
 
 
-def load_from_keychain() -> str:
-    """Retrieve API key from the macOS Keychain. Returns empty string if not found."""
+def load_from_keychain(account: str = KEYCHAIN_ACCOUNT) -> str:
+    """Retrieve a value from the macOS Keychain. Returns empty string if not found."""
     result = subprocess.run(
         ["security", "find-generic-password",
-         "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+         "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
@@ -197,10 +217,41 @@ class TranscribeOneApp:
         self._raw_results: list[tuple[str, str]] = []
         self._speaker_name_vars: dict[str, tk.StringVar] = {}
 
+        # Show Notes Generator state
+        self._anthropic_key_var = tk.StringVar()
+        self._show_anthropic_key = False
+        self._remember_anthropic_key_var = tk.BooleanVar(value=False)
+        self._generating_notes = False
+
+        # API key verification state
+        self._verifying_assemblyai = False
+        self._verifying_anthropic = False
+
+        # Deferred-import tracking.  Heavy libs are pre-loaded in a
+        # background thread right after the window appears.  If the user
+        # clicks an action before loading finishes, an overlay spinner is
+        # shown until the import completes, then the action runs.
+        self._libs_ready = False          # True once bg pre-import finishes
+        self._pending_action = None       # callback queued while overlay is up
+        self._overlay = None              # the overlay Frame, if visible
+
+        # Clear verification feedback when key values change
+        self._api_key_var.trace_add("write", self._on_assemblyai_key_changed)
+        self._anthropic_key_var.trace_add("write", self._on_anthropic_key_changed)
+
         self._setup_styles()
         self._build_ui()
         self._setup_mac_open_document()
         self._load_preferences()
+
+        # After all widgets are packed, schedule a one-time scroll-region
+        # update. (No per-widget mousewheel binding needed — the Tcl-level
+        # handler set up in _setup_tcl_mousewheel() covers everything.)
+        self.root.after_idle(self._update_scroll_region)
+
+        # Start pre-importing heavy libs in a background thread so they
+        # are usually cached by the time the user clicks anything.
+        threading.Thread(target=self._preload_libs, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Styling
@@ -308,8 +359,54 @@ class TranscribeOneApp:
     def _build_ui(self) -> None:
         """Construct all widgets."""
 
+        # --- Fixed Status Bar (always visible at bottom of window) ---
+        self._status_bar = tk.Frame(self.root, bg="#e8e8ea", highlightthickness=0)
+        self._status_bar.pack(side="bottom", fill="x")
+
+        _sep = tk.Frame(self._status_bar, bg="#d1d1d6", height=1)
+        _sep.pack(fill="x", side="top")
+
+        _sb_inner = tk.Frame(self._status_bar, bg="#e8e8ea")
+        _sb_inner.pack(fill="x", padx=14, pady=(4, 6))
+
+        self._status_label = tk.Label(
+            _sb_inner, textvariable=self._status_var,
+            font=("SF Pro Text", 11), fg=CLR_TEXT_SEC, bg="#e8e8ea",
+            anchor="w",
+        )
+        self._status_label.pack(side="left")
+
+        self._progress = ttk.Progressbar(_sb_inner, mode="indeterminate", length=200)
+        self._progress.pack(side="right")
+
+        # --- Scrollable container ---
+        # Wrap all content in a canvas so the window scrolls when
+        # content exceeds the visible area (especially with the Show
+        # Notes Generator section at the bottom).
+        self._canvas = tk.Canvas(self.root, bg=CLR_BG, highlightthickness=0, takefocus=0)
+        self._vscroll = ttk.Scrollbar(self.root, orient="vertical",
+                                       command=self._canvas.yview)
+        self._scroll_frame = tk.Frame(self._canvas, bg=CLR_BG)
+
+        self._canvas_window = self._canvas.create_window(
+            (0, 0), window=self._scroll_frame, anchor="nw",
+        )
+        self._canvas.configure(yscrollcommand=self._vscroll.set)
+
+        self._vscroll.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        # Keep the inner frame width matched to the canvas width.
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mousewheel scrolling via a single Tcl-level binding.
+        # This avoids the Python/Tcl bridge overhead that makes
+        # buttons feel sluggish when hundreds of Python callbacks fire
+        # per second from macOS trackpad scroll events.
+        self._setup_tcl_mousewheel()
+
         # --- App Title Bar ---
-        title_frame = tk.Frame(self.root, bg=CLR_BG)
+        title_frame = tk.Frame(self._scroll_frame, bg=CLR_BG)
         title_frame.pack(fill="x", padx=14, pady=(8, 2))
 
         title_lbl = tk.Label(
@@ -326,23 +423,64 @@ class TranscribeOneApp:
         )
         subtitle_lbl.pack(side="left", padx=(10, 0), pady=(6, 0))
 
-        # --- API Key ---
-        key_content = self._create_section(self.root, "\U0001F511", "API Key")
+        # --- API Keys ---
+        key_content = self._create_section(self._scroll_frame, "\U0001F511", "API Keys")
 
-        key_row = ttk.Frame(key_content, style="Card.TFrame")
-        key_row.pack(fill="x")
+        # AssemblyAI key row
+        ttk.Label(key_content, text="AssemblyAI:", style="Card.TLabel").pack(anchor="w", pady=(0, 2))
 
-        self._api_key_entry = ttk.Entry(key_row, textvariable=self._api_key_var, show="*", width=48)
+        aai_row = ttk.Frame(key_content, style="Card.TFrame")
+        aai_row.pack(fill="x")
+
+        self._api_key_entry = ttk.Entry(aai_row, textvariable=self._api_key_var, show="*", width=40)
         self._api_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        self._toggle_btn = self._make_button(key_row, text="Show", command=self._toggle_api_key_visibility, width=6)
-        self._toggle_btn.pack(side="left", padx=(0, 6))
+        self._toggle_btn = self._make_button(aai_row, text="Show", command=self._toggle_api_key_visibility, width=6)
+        self._toggle_btn.pack(side="left", padx=(0, 4))
 
-        ttk.Checkbutton(key_row, text="Remember", variable=self._remember_key_var).pack(side="left")
+        ttk.Checkbutton(aai_row, text="Remember", variable=self._remember_key_var).pack(side="left", padx=(0, 4))
+
+        self._verify_aai_btn = self._make_button(aai_row, text="Verify", command=self._verify_assemblyai_key, width=6)
+        self._verify_aai_btn.pack(side="left")
+
+        self._aai_verify_label = ttk.Label(key_content, text="", style="CardMuted.TLabel")
+        self._aai_verify_label.pack(anchor="w", pady=(2, 0))
+
+        # Anthropic key row (only when show_notes_processor is available)
+        if HAS_SHOW_NOTES:
+            ttk.Label(key_content, text="Anthropic:", style="Card.TLabel").pack(anchor="w", pady=(6, 2))
+
+            anthropic_row = ttk.Frame(key_content, style="Card.TFrame")
+            anthropic_row.pack(fill="x")
+
+            self._anthropic_key_entry = ttk.Entry(
+                anthropic_row, textvariable=self._anthropic_key_var, show="*", width=40,
+            )
+            self._anthropic_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+            self._anthropic_toggle_btn = self._make_button(
+                anthropic_row, text="Show",
+                command=self._toggle_anthropic_key_visibility, width=6,
+            )
+            self._anthropic_toggle_btn.pack(side="left", padx=(0, 4))
+
+            ttk.Checkbutton(
+                anthropic_row, text="Remember",
+                variable=self._remember_anthropic_key_var,
+            ).pack(side="left", padx=(0, 4))
+
+            self._verify_anthropic_btn = self._make_button(
+                anthropic_row, text="Verify",
+                command=self._verify_anthropic_key, width=6,
+            )
+            self._verify_anthropic_btn.pack(side="left")
+
+            self._anthropic_verify_label = ttk.Label(key_content, text="", style="CardMuted.TLabel")
+            self._anthropic_verify_label.pack(anchor="w", pady=(2, 0))
 
         # --- Source Media ---
         media_title = "Source Media" if HAS_FFMPEG else "Audio File"
-        file_content = self._create_section(self.root, "\U0001F3B5", media_title)
+        file_content = self._create_section(self._scroll_frame, "\U0001F3B5", media_title)
 
         path_row = ttk.Frame(file_content, style="Card.TFrame")
         path_row.pack(fill="x")
@@ -352,7 +490,7 @@ class TranscribeOneApp:
 
         self._make_button(path_row, text="Browse\u2026", command=self._browse_file).pack(side="left")
 
-        fmt_list = ", ".join(ext.lstrip(".") for ext in transcribeone.SUPPORTED_FORMATS)
+        fmt_list = ", ".join(ext.lstrip(".") for ext in SUPPORTED_FORMATS)
         if HAS_FFMPEG:
             fmt_list += "  |  Video: " + ", ".join(ext.lstrip(".") for ext in VIDEO_FORMATS)
         fmt_label = ttk.Label(file_content, text=f"Supported: {fmt_list}", style="CardMuted.TLabel")
@@ -366,7 +504,7 @@ class TranscribeOneApp:
             ).pack(anchor="w", pady=(2, 0))
 
         # --- Audio Player ---
-        player_content = self._create_section(self.root, "\U0001F50A", "Player")
+        player_content = self._create_section(self._scroll_frame, "\U0001F50A", "Player")
 
         controls_row = ttk.Frame(player_content, style="Card.TFrame")
         controls_row.pack(fill="x")
@@ -403,7 +541,7 @@ class TranscribeOneApp:
             ttk.Label(player_content, text="Audio playback unavailable (pygame not installed)", foreground="#cc0000").pack(anchor="w")
 
         # --- Output Directory ---
-        outdir_content = self._create_section(self.root, "\U0001F4C2", "Output Directory")
+        outdir_content = self._create_section(self._scroll_frame, "\U0001F4C2", "Output Directory")
 
         outdir_row = ttk.Frame(outdir_content, style="Card.TFrame")
         outdir_row.pack(fill="x")
@@ -421,7 +559,7 @@ class TranscribeOneApp:
         ).pack(anchor="w", pady=(4, 0))
 
         # --- Speaker Names ---
-        names_content = self._create_section(self.root, "\U0001F465", "Speaker Names (optional)")
+        names_content = self._create_section(self._scroll_frame, "\U0001F465", "Speaker Names (optional)")
 
         self._speaker_names_var = tk.StringVar()
         names_entry = ttk.Entry(names_content, textvariable=self._speaker_names_var)
@@ -434,7 +572,7 @@ class TranscribeOneApp:
         ).pack(anchor="w", pady=(4, 0))
 
         # --- Transcribe ---
-        ctrl_frame = tk.Frame(self.root, bg=CLR_BG)
+        ctrl_frame = tk.Frame(self._scroll_frame, bg=CLR_BG)
         ctrl_frame.pack(fill="x", padx=14, pady=(3, 1))
 
         self._transcribe_btn = self._make_button(
@@ -444,18 +582,8 @@ class TranscribeOneApp:
         )
         self._transcribe_btn.pack(side="right")
 
-        # --- Status / Progress ---
-        status_frame = ttk.Frame(self.root, style="Status.TFrame")
-        status_frame.pack(fill="x", padx=14, pady=(0, 2))
-
-        self._status_label = ttk.Label(status_frame, textvariable=self._status_var, style="Status.TLabel")
-        self._status_label.pack(side="left")
-
-        self._progress = ttk.Progressbar(status_frame, mode="indeterminate", length=200)
-        self._progress.pack(side="right")
-
         # --- Speaker Rename (shown after transcription if API identification failed) ---
-        self._rename_outer = tk.Frame(self.root, bg=CLR_SECTION_BD, bd=0, highlightthickness=0)
+        self._rename_outer = tk.Frame(self._scroll_frame, bg=CLR_SECTION_BD, bd=0, highlightthickness=0)
         # Not packed yet — shown only when needed
         self._rename_inner_card = tk.Frame(self._rename_outer, bg=CLR_SECTION_BG, bd=0, highlightthickness=0)
         self._rename_inner_card.pack(fill="both", expand=True, padx=1, pady=1)
@@ -477,8 +605,8 @@ class TranscribeOneApp:
         )
 
         # --- Results ---
-        result_outer = tk.Frame(self.root, bg=CLR_SECTION_BD, bd=0, highlightthickness=0)
-        result_outer.pack(fill="both", expand=True, padx=14, pady=5)
+        result_outer = tk.Frame(self._scroll_frame, bg=CLR_SECTION_BD, bd=0, highlightthickness=0)
+        result_outer.pack(fill="x", padx=14, pady=5)
 
         result_inner = tk.Frame(result_outer, bg=CLR_SECTION_BG, bd=0, highlightthickness=0)
         result_inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -500,6 +628,7 @@ class TranscribeOneApp:
             relief="flat", bd=0, highlightthickness=1,
             highlightbackground=CLR_SECTION_BD,
             insertbackground=CLR_TEXT,
+            height=15,
         )
         scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self._result_text.yview)
         self._result_text.configure(yscrollcommand=scrollbar.set)
@@ -518,6 +647,161 @@ class TranscribeOneApp:
         self._output_path_label = ttk.Label(btn_row, text="", style="CardMuted.TLabel")
         self._output_path_label.pack(side="right")
 
+        # --- Show Notes Generator ---
+        if HAS_SHOW_NOTES:
+            notes_content = self._create_section(
+                self._scroll_frame, "\U0001F4DD", "Show Notes Generator"
+            )
+
+            # Generate button + status
+            gen_row = tk.Frame(notes_content, bg=CLR_SECTION_BG)
+            gen_row.pack(fill="x")
+
+            self._generate_btn = self._make_button(
+                gen_row, text="\u2728  Generate Show Notes",
+                command=self._start_show_notes,
+                font=("SF Pro Text", 13, "bold"),
+            )
+            self._generate_btn.pack(side="right")
+
+            # Output info
+            self._notes_output_label = ttk.Label(
+                notes_content, text="", style="CardMuted.TLabel", wraplength=600,
+            )
+            self._notes_output_label.pack(anchor="w", pady=(4, 0))
+
+        # Bottom spacer so the last section isn't flush with the window edge
+        tk.Frame(self._scroll_frame, bg=CLR_BG, height=20).pack(fill="x")
+
+    # ------------------------------------------------------------------
+    # Scrollable container helpers
+    # ------------------------------------------------------------------
+
+    def _update_scroll_region(self) -> None:
+        """Recalculate the canvas scroll region after layout changes.
+
+        Called explicitly after UI build and content changes instead of
+        via a <Configure> binding (which on macOS fires hundreds of times
+        at startup and blocks the event loop).
+        """
+        self._scroll_frame.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event) -> None:
+        """Keep the inner frame width matched to the canvas."""
+        self._canvas.itemconfig(self._canvas_window, width=event.width)
+        # Also refresh scroll region since the available area changed.
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    # --- Mousewheel scrolling (single Tcl-level handler) ---------------
+
+    def _setup_tcl_mousewheel(self) -> None:
+        """Install a single Tcl-level mousewheel handler for the canvas.
+
+        On macOS, trackpad two-finger scrolling floods the event loop
+        with MouseWheel events (60+ per second).  A Python-level
+        ``bind_all`` or per-widget ``bind`` invokes the Python/Tcl bridge
+        for every single one, making buttons feel laggy.
+
+        Instead, we install ONE handler in pure Tcl that runs entirely
+        inside the Tcl interpreter.  It checks if the cursor is over a
+        Text widget (which scrolls itself) or a Button (to avoid
+        scroll-during-click), and otherwise scrolls the canvas.  Zero
+        Python callbacks fire for mousewheel events.
+        """
+        canvas_path = str(self._canvas)
+        self.root.tk.eval(f'''
+            bind all <MouseWheel> {{
+                set w [winfo containing %X %Y]
+                if {{$w eq ""}} return
+                set cls [winfo class $w]
+                if {{$cls eq "Text" || $cls eq "Button"}} return
+                {canvas_path} yview scroll [expr {{-(%D)}}] units
+            }}
+        ''')
+
+    # ------------------------------------------------------------------
+    # Deferred library loading + loading overlay
+    # ------------------------------------------------------------------
+
+    def _preload_libs(self) -> None:
+        """Pre-import heavy libraries in a background thread.
+
+        Runs immediately after the GUI appears.  By the time the user
+        reads the UI and clicks a button, the imports are usually already
+        cached and subsequent ``import`` statements are instant.
+        """
+        try:
+            import pygame                   # noqa: F811 — lazy preload
+            import transcribeone            # noqa: F811 — pulls in assemblyai
+            if HAS_SHOW_NOTES:
+                import anthropic            # noqa: F811
+                import show_notes_processor  # noqa: F811
+        except Exception:
+            pass
+        # Signal the main thread that imports are ready.
+        self.root.after(0, self._on_libs_ready)
+
+    def _on_libs_ready(self) -> None:
+        """Called on the main thread once background pre-import finishes."""
+        self._libs_ready = True
+        # If the user clicked an action while the overlay was up,
+        # dismiss the overlay and run the queued action now.
+        if self._overlay is not None:
+            self._dismiss_overlay()
+        if self._pending_action is not None:
+            action = self._pending_action
+            self._pending_action = None
+            action()
+
+    def _require_libs(self, action) -> bool:
+        """Gate an action on heavy libs being loaded.
+
+        If libs are ready, returns True and the caller should proceed.
+        If not, shows a loading overlay and queues *action* to run when
+        the imports finish.  Returns False (caller should return early).
+        """
+        if self._libs_ready:
+            return True
+        self._pending_action = action
+        self._show_overlay()
+        return False
+
+    def _show_overlay(self) -> None:
+        """Display a semi-transparent loading overlay over the whole window."""
+        if self._overlay is not None:
+            return  # already showing
+        ov = tk.Frame(self.root, bg="#f5f5f7")
+        ov.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        # Center the message + spinner
+        inner = tk.Frame(ov, bg="#f5f5f7")
+        inner.place(relx=0.5, rely=0.4, anchor="center")
+
+        tk.Label(
+            inner, text="Loading libraries\u2026",
+            font=("SF Pro Display", 16, "bold"),
+            fg=CLR_TEXT, bg="#f5f5f7",
+        ).pack()
+        tk.Label(
+            inner,
+            text="This only happens once after launch.",
+            font=("SF Pro Text", 12),
+            fg=CLR_TEXT_SEC, bg="#f5f5f7",
+        ).pack(pady=(6, 12))
+        spinner = ttk.Progressbar(inner, mode="indeterminate", length=220)
+        spinner.pack()
+        spinner.start(12)
+
+        self._overlay = ov
+        ov.lift()   # ensure it's on top of everything
+
+    def _dismiss_overlay(self) -> None:
+        """Remove the loading overlay."""
+        if self._overlay is not None:
+            self._overlay.destroy()
+            self._overlay = None
+
     # ------------------------------------------------------------------
     # File handling
     # ------------------------------------------------------------------
@@ -531,7 +815,7 @@ class TranscribeOneApp:
 
     def _mac_open_document(self, *args) -> None:
         """Called by macOS when files are opened via the app."""
-        all_formats = transcribeone.SUPPORTED_FORMATS
+        all_formats = SUPPORTED_FORMATS
         if HAS_FFMPEG:
             all_formats = all_formats + VIDEO_FORMATS
         for path in args:
@@ -553,15 +837,34 @@ class TranscribeOneApp:
     # Audio Player
     # ------------------------------------------------------------------
 
-    def _load_audio(self, path: str) -> bool:
-        """Load an audio file into pygame mixer. Returns True on success."""
+    def _ensure_mixer(self) -> bool:
+        """Lazily import pygame and initialise the mixer on first use.
+
+        Returns True if the mixer is (now) ready.  Stores the imported
+        module as ``self._pygame`` so subsequent calls avoid re-import.
+        """
         if not HAS_AUDIO:
             return False
         try:
-            pygame.mixer.music.load(path)
+            pg = getattr(self, "_pygame", None)
+            if pg is None:
+                import pygame as pg
+                self._pygame = pg
+            if not pg.mixer.get_init():
+                pg.mixer.init()
+            return True
+        except Exception:
+            return False
+
+    def _load_audio(self, path: str) -> bool:
+        """Load an audio file into pygame mixer. Returns True on success."""
+        if not self._ensure_mixer():
+            return False
+        try:
+            self._pygame.mixer.music.load(path)
             # Get duration using Sound object (works for wav/ogg; mp3 may be approximate)
             try:
-                snd = pygame.mixer.Sound(path)
+                snd = self._pygame.mixer.Sound(path)
                 self._duration = snd.get_length()
                 del snd
             except Exception:
@@ -586,7 +889,7 @@ class TranscribeOneApp:
             return
 
         if self._paused:
-            pygame.mixer.music.unpause()
+            self._pygame.mixer.music.unpause()
             self._paused = False
             self._playing = True
             self._play_btn.configure(text="\u23F8 Pause")
@@ -594,7 +897,7 @@ class TranscribeOneApp:
             return
 
         if self._playing:
-            pygame.mixer.music.pause()
+            self._pygame.mixer.music.pause()
             self._paused = True
             self._playing = False
             self._play_btn.configure(text="\u25B6 Play")
@@ -609,7 +912,7 @@ class TranscribeOneApp:
         speed = float(self._speed_var.get().rstrip("x"))
 
         try:
-            pygame.mixer.music.play()
+            self._pygame.mixer.music.play()
             # pygame doesn't support native speed change; we reinit mixer at adjusted frequency
             if speed != 1.0:
                 self._apply_speed(speed, audio_file)
@@ -627,7 +930,7 @@ class TranscribeOneApp:
         if not HAS_AUDIO:
             return
         try:
-            pygame.mixer.music.stop()
+            self._pygame.mixer.music.stop()
         except Exception:
             pass
         self._playing = False
@@ -640,21 +943,21 @@ class TranscribeOneApp:
     def _apply_speed(self, speed: float, audio_file: str) -> None:
         """Reinitialize mixer at an adjusted sample rate to simulate speed change."""
         try:
-            pygame.mixer.music.stop()
+            self._pygame.mixer.music.stop()
             # Default CD-quality sample rate
             base_freq = 44100
             new_freq = int(base_freq * speed)
-            pygame.mixer.quit()
-            pygame.mixer.init(frequency=new_freq)
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
+            self._pygame.mixer.quit()
+            self._pygame.mixer.init(frequency=new_freq)
+            self._pygame.mixer.music.load(audio_file)
+            self._pygame.mixer.music.play()
             self._loaded_audio_path = audio_file
         except Exception:
             # Fall back to normal speed
-            pygame.mixer.quit()
-            pygame.mixer.init()
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
+            self._pygame.mixer.quit()
+            self._pygame.mixer.init()
+            self._pygame.mixer.music.load(audio_file)
+            self._pygame.mixer.music.play()
             self._loaded_audio_path = audio_file
 
     def _on_speed_change(self, event=None) -> None:
@@ -668,7 +971,7 @@ class TranscribeOneApp:
             pos = self._position_var.get()
             self._apply_speed(speed, audio_file)
             try:
-                pygame.mixer.music.set_pos(pos)
+                self._pygame.mixer.music.set_pos(pos)
             except Exception:
                 pass
             self._playing = True
@@ -681,10 +984,10 @@ class TranscribeOneApp:
             return
         pos = float(value)
         try:
-            pygame.mixer.music.play(start=pos)
+            self._pygame.mixer.music.play(start=pos)
         except Exception:
             try:
-                pygame.mixer.music.set_pos(pos)
+                self._pygame.mixer.music.set_pos(pos)
             except Exception:
                 pass
         self._update_time_label(pos)
@@ -705,7 +1008,7 @@ class TranscribeOneApp:
         if not self._playing:
             return
 
-        if not pygame.mixer.music.get_busy():
+        if not self._pygame.mixer.music.get_busy():
             # Playback ended naturally
             self._playing = False
             self._paused = False
@@ -715,7 +1018,7 @@ class TranscribeOneApp:
             return
 
         # get_pos() returns milliseconds since play() was called
-        pos_ms = pygame.mixer.music.get_pos()
+        pos_ms = self._pygame.mixer.music.get_pos()
         if pos_ms >= 0:
             pos_sec = pos_ms / 1000.0
             self._position_var.set(pos_sec)
@@ -737,35 +1040,103 @@ class TranscribeOneApp:
     # ------------------------------------------------------------------
 
     def _load_preferences(self) -> None:
-        """Load saved preferences on startup."""
-        # Check environment variable first
+        """Load saved preferences on startup.
+
+        Environment variables and local config are read immediately.
+        Keychain look-ups are dispatched to a background thread so
+        they cannot block the UI (macOS Keychain access can take tens
+        of seconds, especially inside an unsigned .app bundle).
+        """
+        # Check environment variables first (instant)
         env_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
         if env_key:
             self._api_key_var.set(env_key)
 
-        # Then check keychain (won't overwrite if env var was set)
+        env_anthropic = ""
+        if HAS_SHOW_NOTES:
+            env_anthropic = os.getenv("ANTHROPIC_API_KEY", "").strip()
+            if env_anthropic:
+                self._anthropic_key_var.set(env_anthropic)
+
+        # Local config file (fast)
         config = load_config()
         if config.get("remember_key"):
             self._remember_key_var.set(True)
-            if not env_key:
-                key = load_from_keychain()
-                if key:
-                    self._api_key_var.set(key)
+        if HAS_SHOW_NOTES and config.get("remember_anthropic_key"):
+            self._remember_anthropic_key_var.set(True)
 
         # Restore output directory
         outdir = config.get("output_dir", "")
         if outdir and os.path.isdir(outdir):
             self._output_dir_var.set(outdir)
 
-    def _save_preferences(self) -> None:
-        """Persist preferences."""
+        # Keychain look-ups in a background thread (can be slow)
+        need_aai = config.get("remember_key") and not env_key
+        need_anthropic = (HAS_SHOW_NOTES
+                          and config.get("remember_anthropic_key")
+                          and not env_anthropic)
+        if need_aai or need_anthropic:
+            self._status_var.set("Loading saved API keys\u2026")
+            threading.Thread(
+                target=self._load_keychain_keys,
+                args=(need_aai, need_anthropic),
+                daemon=True,
+            ).start()
+
+    def _load_keychain_keys(self, need_aai: bool, need_anthropic: bool) -> None:
+        """Load API keys from macOS Keychain (runs in background thread)."""
+        if need_aai:
+            key = load_from_keychain()
+            if key:
+                self.root.after(0, self._api_key_var.set, key)
+        if need_anthropic:
+            akey = load_from_keychain(account=KEYCHAIN_ANTHROPIC)
+            if akey:
+                self.root.after(0, self._anthropic_key_var.set, akey)
+        self.root.after(0, self._status_var.set, "Ready")
+
+    def _save_preferences(self, blocking: bool = False) -> None:
+        """Persist preferences.
+
+        Config file is written immediately (fast).  Keychain writes use
+        subprocess and can block for seconds on macOS, so by default
+        they run in a background thread.  Pass ``blocking=True`` (used
+        at app close) to wait for them.
+        """
         remember = self._remember_key_var.get()
+        remember_anthropic = self._remember_anthropic_key_var.get()
         outdir = self._output_dir_var.get().strip()
-        save_config({"remember_key": remember, "output_dir": outdir})
+        save_config({
+            "remember_key": remember,
+            "remember_anthropic_key": remember_anthropic,
+            "output_dir": outdir,
+        })
+
+        keys_to_save: list[tuple[str, str]] = []
         if remember:
             api_key = self._api_key_var.get().strip()
             if api_key:
-                save_to_keychain(api_key)
+                keys_to_save.append((api_key, KEYCHAIN_ACCOUNT))
+        if remember_anthropic:
+            anthropic_key = self._anthropic_key_var.get().strip()
+            if anthropic_key:
+                keys_to_save.append((anthropic_key, KEYCHAIN_ANTHROPIC))
+
+        if keys_to_save:
+            if blocking:
+                self._write_keychain_keys(keys_to_save)
+            else:
+                threading.Thread(
+                    target=self._write_keychain_keys,
+                    args=(keys_to_save,),
+                    daemon=True,
+                ).start()
+
+    @staticmethod
+    def _write_keychain_keys(keys: list[tuple[str, str]]) -> None:
+        """Write API keys to macOS Keychain (may block)."""
+        for value, account in keys:
+            save_to_keychain(value, account=account)
 
     # ------------------------------------------------------------------
     # Actions
@@ -776,6 +1147,113 @@ class TranscribeOneApp:
         self._show_key = not self._show_key
         self._api_key_entry.configure(show="" if self._show_key else "*")
         self._toggle_btn.configure(text="Hide" if self._show_key else "Show")
+
+    # ------------------------------------------------------------------
+    # API key verification
+    # ------------------------------------------------------------------
+
+    def _verify_assemblyai_key(self) -> None:
+        """Verify the AssemblyAI API key with a lightweight API call."""
+        if self._verifying_assemblyai:
+            return
+        api_key = self._api_key_var.get().strip()
+        if not api_key:
+            self._aai_verify_label.configure(text="Please enter a key first", foreground=CLR_ERROR)
+            return
+        self._verifying_assemblyai = True
+        self._verify_aai_btn.configure(state="disabled")
+        self._aai_verify_label.configure(text="Verifying\u2026", foreground=CLR_TEXT_SEC)
+        self._status_var.set("Verifying AssemblyAI key\u2026")
+        self._progress.start(10)
+        threading.Thread(
+            target=self._verify_assemblyai_worker, args=(api_key,), daemon=True,
+        ).start()
+
+    def _verify_assemblyai_worker(self, api_key: str) -> None:
+        """Background: GET transcript list endpoint to validate key."""
+        import urllib.request
+        import urllib.error
+        try:
+            req = urllib.request.Request(
+                "https://api.assemblyai.com/v2/transcript?limit=1",
+                headers={"Authorization": api_key},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    self.root.after(0, self._on_verify_assemblyai_result, True, "")
+                else:
+                    self.root.after(0, self._on_verify_assemblyai_result, False, f"HTTP {resp.status}")
+        except urllib.error.HTTPError as exc:
+            msg = "Invalid API key" if exc.code == 401 else f"HTTP {exc.code}"
+            self.root.after(0, self._on_verify_assemblyai_result, False, msg)
+        except Exception as exc:
+            self.root.after(0, self._on_verify_assemblyai_result, False, str(exc))
+
+    def _on_verify_assemblyai_result(self, success: bool, error: str) -> None:
+        """Handle AssemblyAI verification result on main thread."""
+        self._progress.stop()
+        self._verifying_assemblyai = False
+        self._verify_aai_btn.configure(state="normal")
+        if success:
+            self._aai_verify_label.configure(text="\u2713 Valid API key", foreground=CLR_SUCCESS)
+            self._status_var.set("AssemblyAI key verified")
+        else:
+            self._aai_verify_label.configure(text=f"\u2717 {error}", foreground=CLR_ERROR)
+            self._status_var.set("AssemblyAI key verification failed")
+
+    def _verify_anthropic_key(self) -> None:
+        """Verify the Anthropic API key with a lightweight API call."""
+        if not self._require_libs(self._verify_anthropic_key):
+            return
+        if self._verifying_anthropic:
+            return
+        api_key = self._anthropic_key_var.get().strip()
+        if not api_key:
+            self._anthropic_verify_label.configure(text="Please enter a key first", foreground=CLR_ERROR)
+            return
+        self._verifying_anthropic = True
+        self._verify_anthropic_btn.configure(state="disabled")
+        self._anthropic_verify_label.configure(text="Verifying\u2026", foreground=CLR_TEXT_SEC)
+        self._status_var.set("Verifying Anthropic key\u2026")
+        self._progress.start(10)
+        threading.Thread(
+            target=self._verify_anthropic_worker, args=(api_key,), daemon=True,
+        ).start()
+
+    def _verify_anthropic_worker(self, api_key: str) -> None:
+        """Background: call Anthropic models.list() to validate key."""
+        import anthropic  # deferred import — heavy lib loaded in bg thread
+
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            client.models.list()
+            self.root.after(0, self._on_verify_anthropic_result, True, "")
+        except anthropic.AuthenticationError:
+            self.root.after(0, self._on_verify_anthropic_result, False, "Invalid API key")
+        except Exception as exc:
+            self.root.after(0, self._on_verify_anthropic_result, False, str(exc))
+
+    def _on_verify_anthropic_result(self, success: bool, error: str) -> None:
+        """Handle Anthropic verification result on main thread."""
+        self._progress.stop()
+        self._verifying_anthropic = False
+        self._verify_anthropic_btn.configure(state="normal")
+        if success:
+            self._anthropic_verify_label.configure(text="\u2713 Valid API key", foreground=CLR_SUCCESS)
+            self._status_var.set("Anthropic key verified")
+        else:
+            self._anthropic_verify_label.configure(text=f"\u2717 {error}", foreground=CLR_ERROR)
+            self._status_var.set("Anthropic key verification failed")
+
+    def _on_assemblyai_key_changed(self, *args) -> None:
+        """Clear verification feedback when the AssemblyAI key is edited."""
+        if hasattr(self, "_aai_verify_label"):
+            self._aai_verify_label.configure(text="")
+
+    def _on_anthropic_key_changed(self, *args) -> None:
+        """Clear verification feedback when the Anthropic key is edited."""
+        if hasattr(self, "_anthropic_verify_label"):
+            self._anthropic_verify_label.configure(text="")
 
     def _browse_file(self) -> None:
         """Open a native file dialog for audio selection."""
@@ -812,8 +1290,31 @@ class TranscribeOneApp:
                 pass
             self._tmp_audio_file = ""
 
+    @staticmethod
+    def _validate_audio_file(audio_file: str) -> None:
+        """Validate audio file without importing transcribeone.
+
+        Mirrors transcribeone.validate_audio_file() to avoid loading the
+        heavy assemblyai library on the main thread.
+        """
+        if not os.path.exists(audio_file):
+            raise ValueError(f"File not found: {audio_file}")
+        if not os.path.isfile(audio_file):
+            raise ValueError(f"Not a file: {audio_file}")
+        if not os.access(audio_file, os.R_OK):
+            raise ValueError(f"Permission denied: {audio_file}")
+        if os.path.getsize(audio_file) == 0:
+            raise ValueError(f"File is empty: {audio_file}")
+        if not audio_file.lower().endswith(SUPPORTED_FORMATS):
+            raise ValueError(
+                f"Unsupported audio format: {audio_file}\n"
+                f"Supported formats: {', '.join(SUPPORTED_FORMATS)}"
+            )
+
     def _start_transcription(self) -> None:
         """Validate inputs and launch the background transcription."""
+        if not self._require_libs(self._start_transcription):
+            return
         try:
             if self._transcribing:
                 return
@@ -834,7 +1335,7 @@ class TranscribeOneApp:
 
             if not is_video:
                 try:
-                    transcribeone.validate_audio_file(audio_file)
+                    self._validate_audio_file(audio_file)
                 except ValueError as exc:
                     messagebox.showerror("Invalid File", str(exc))
                     return
@@ -842,8 +1343,6 @@ class TranscribeOneApp:
                 if not os.path.isfile(audio_file):
                     messagebox.showerror("File Not Found", f"Cannot find: {audio_file}")
                     return
-
-            transcribeone.set_api_key(api_key)
             self._save_preferences()
 
             # Parse speaker names
@@ -874,6 +1373,8 @@ class TranscribeOneApp:
 
     def _transcription_worker(self, audio_file: str, api_key: str, speaker_names: list[str], is_video: bool = False) -> None:
         """Run transcription in a background thread. Must NOT touch tkinter."""
+        import transcribeone  # deferred — pulls in assemblyai (heavy)
+
         try:
             self._cleanup_tmp_audio()
 
@@ -884,6 +1385,7 @@ class TranscribeOneApp:
                 self._tmp_audio_file = actual_audio
                 self.root.after(0, self._status_var.set, "Uploading and transcribing\u2026")
 
+            transcribeone.set_api_key(api_key)
             transcript_id, results = transcribeone.run_transcription(actual_audio)
 
             speakers_identified = False
@@ -937,6 +1439,9 @@ class TranscribeOneApp:
         else:
             self._status_var.set("Done")
 
+        # Content changed — refresh scroll region
+        self._update_scroll_region()
+
     def _build_rename_fields(self, results: list[tuple[str, str]]) -> None:
         """Show editable name fields for each unique speaker (up to 6)."""
         # Clear previous
@@ -972,6 +1477,9 @@ class TranscribeOneApp:
 
         # Show the rename frame above the transcript
         self._rename_outer.pack(fill="x", padx=14, pady=5, before=self._result_frame.master.master)
+
+        # Content changed — refresh scroll region
+        self._update_scroll_region()
 
     def _get_speaker_display(self, label: str, identified: bool) -> str:
         """Get the display name for a speaker, checking rename fields first."""
@@ -1054,6 +1562,11 @@ class TranscribeOneApp:
         self._transcribe_btn.configure(state=state)
         self._api_key_entry.configure(state=state)
         self._toggle_btn.configure(state=state)
+        self._verify_aai_btn.configure(state=state)
+        if HAS_SHOW_NOTES:
+            self._anthropic_key_entry.configure(state=state)
+            self._anthropic_toggle_btn.configure(state=state)
+            self._verify_anthropic_btn.configure(state=state)
 
     def _copy_to_clipboard(self) -> None:
         """Copy the transcript to the system clipboard."""
@@ -1089,14 +1602,127 @@ class TranscribeOneApp:
     def _on_close(self) -> None:
         """Handle window close."""
         self._stop_playback()
-        self._save_preferences()
+        self._save_preferences(blocking=True)
         self._cleanup_tmp_audio()
-        if HAS_AUDIO:
+        pg = getattr(self, "_pygame", None)
+        if pg is not None and pg.mixer.get_init():
             try:
-                pygame.mixer.quit()
+                pg.mixer.quit()
             except Exception:
                 pass
         self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # Show Notes Generator
+    # ------------------------------------------------------------------
+
+    def _toggle_anthropic_key_visibility(self) -> None:
+        """Toggle between masked and visible Anthropic API key."""
+        self._show_anthropic_key = not self._show_anthropic_key
+        self._anthropic_key_entry.configure(
+            show="" if self._show_anthropic_key else "*"
+        )
+        self._anthropic_toggle_btn.configure(
+            text="Hide" if self._show_anthropic_key else "Show"
+        )
+
+    def _start_show_notes(self) -> None:
+        """Validate inputs and launch background show-notes generation."""
+        if not self._require_libs(self._start_show_notes):
+            return
+        if not HAS_SHOW_NOTES:
+            messagebox.showerror(
+                "Unavailable",
+                "Show notes processor is not available.\n"
+                "Install: pip install anthropic python-docx",
+            )
+            return
+
+        if self._generating_notes:
+            return
+
+        api_key = self._anthropic_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror(
+                "Missing API Key",
+                "Please enter your Anthropic API key.",
+            )
+            return
+
+        # Get transcript text
+        transcript_text = self._result_text.get("1.0", "end-1c").strip()
+        if not transcript_text or transcript_text == "No speech detected.":
+            messagebox.showerror(
+                "No Transcript",
+                "Please transcribe an audio file first.",
+            )
+            return
+
+        # Determine output directory
+        outdir = self._output_dir_var.get().strip()
+        if not outdir and self._current_audio_file:
+            outdir = os.path.dirname(self._current_audio_file)
+        if not outdir:
+            outdir = os.path.expanduser("~/Desktop")
+
+        # Save Anthropic key preferences
+        self._save_preferences()
+
+        # Lock UI
+        self._generating_notes = True
+        self._generate_btn.configure(state="disabled")
+        self._status_var.set("Generating show notes with Claude\u2026")
+        self._progress.start(10)
+        self._notes_output_label.configure(text="")
+
+        thread = threading.Thread(
+            target=self._show_notes_worker,
+            args=(transcript_text, api_key, outdir),
+            daemon=True,
+        )
+        thread.start()
+
+    def _show_notes_worker(self, transcript_text: str, api_key: str,
+                           output_dir: str) -> None:
+        """Run show-notes generation in a background thread."""
+        import show_notes_processor  # deferred import — heavy lib loaded in bg thread
+
+        try:
+            result = show_notes_processor.process_transcript(
+                transcript_text, api_key, output_dir,
+            )
+            self.root.after(0, self._on_show_notes_complete, result)
+        except Exception as exc:
+            self.root.after(0, self._on_show_notes_error, str(exc))
+
+    def _on_show_notes_complete(self, result: dict) -> None:
+        """Handle successful show-notes generation (main thread)."""
+        self._progress.stop()
+        self._generating_notes = False
+        self._generate_btn.configure(state="normal")
+        self._status_var.set("Show notes generated")
+
+        docx_path = result.get("docx_path", "")
+        md_path = result.get("md_path", "")
+        title = result.get("title", "")
+        guest = result.get("guest", "")
+
+        info = f"Saved: {os.path.basename(docx_path)}  |  {os.path.basename(md_path)}"
+        self._notes_output_label.configure(text=info)
+
+        detail = f"Show notes generated for: {title}"
+        if guest and guest.lower() != "none":
+            detail += f"\nGuest: {guest}"
+        detail += f"\n\n.docx: {docx_path}\n.md:   {md_path}"
+        messagebox.showinfo("Show Notes Ready", detail)
+
+    def _on_show_notes_error(self, error_message: str) -> None:
+        """Handle show-notes generation error (main thread)."""
+        self._progress.stop()
+        self._generating_notes = False
+        self._generate_btn.configure(state="normal")
+        self._status_var.set("Show notes error")
+        messagebox.showerror("Show Notes Error", error_message)
 
 
 # ---------------------------------------------------------------------------
