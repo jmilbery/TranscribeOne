@@ -63,23 +63,54 @@ def validate_audio_file(audio_file: str) -> None:
         )
 
 
-def run_transcription(audio_file: str) -> tuple[str, list[tuple[str, str]]]:
-    """Transcribe audio and return (transcript_id, [(speaker, text), ...]).
+def run_transcription(
+    audio_file: str,
+    word_boost: list[str] | None = None,
+    auto_chapters: bool = False,
+) -> tuple[str, list[tuple[str, str]], list[dict] | None]:
+    """Transcribe audio and return (transcript_id, utterances, chapters).
+
+    Args:
+        audio_file: Path to the audio file.
+        word_boost: Optional list of words to boost recognition for.
+        auto_chapters: Whether to auto-detect chapters.
+
+    Returns:
+        (transcript_id, [(speaker, text), ...], chapters_or_None)
+        Each chapter dict has: headline, summary, gist, start, end.
 
     Raises TranscribeError on API failure.
     """
-    config = aai.TranscriptionConfig(speaker_labels=True)
+    config_kwargs: dict = {"speaker_labels": True}
+    if word_boost:
+        config_kwargs["word_boost"] = word_boost
+    if auto_chapters:
+        config_kwargs["auto_chapters"] = True
+    config = aai.TranscriptionConfig(**config_kwargs)
     transcriber = aai.Transcriber()
     transcript = transcriber.transcribe(audio_file, config)
 
     if transcript.status == aai.TranscriptStatus.error:
         raise TranscribeError(f"Transcription failed: {transcript.error}")
 
+    chapters = None
+    if auto_chapters and transcript.chapters:
+        chapters = [
+            {
+                "headline": ch.headline,
+                "summary": ch.summary,
+                "gist": ch.gist,
+                "start": ch.start,
+                "end": ch.end,
+            }
+            for ch in transcript.chapters
+        ]
+
     if not transcript.utterances:
-        return (transcript.id, [])
+        return (transcript.id, [], chapters)
 
     results = [(u.speaker, u.text) for u in transcript.utterances]
-    return (transcript.id, results)
+    return (transcript.id, results, chapters)
 
 
 def identify_speakers(
@@ -166,23 +197,18 @@ def transcribe_audio(audio_file: str) -> None:
     """
     Transcribe the given audio file and print speaker-labeled output.
     """
-    config = aai.TranscriptionConfig(
-        speaker_labels=True,
-    )
-
-    transcriber = aai.Transcriber()
-    transcript = transcriber.transcribe(audio_file, config)
-
-    if transcript.status == aai.TranscriptStatus.error:
-        print(f"Error: Transcription failed: {transcript.error}", file=sys.stderr)
+    try:
+        transcript_id, results, chapters = run_transcription(audio_file)
+    except TranscribeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if not transcript.utterances:
+    if not results:
         print("No speech detected.")
         return
 
-    for utterance in transcript.utterances:
-        print(f"Speaker {utterance.speaker}: {utterance.text}")
+    for speaker, text in results:
+        print(f"Speaker {speaker}: {text}")
 
 
 def main() -> None:

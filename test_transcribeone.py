@@ -109,7 +109,7 @@ class TestRunTranscription:
         return u
 
     def test_returns_id_and_tuples(self):
-        """Successful transcription returns (id, [(speaker, text)])."""
+        """Successful transcription returns (id, [(speaker, text)], chapters)."""
         mock_transcript = MagicMock()
         mock_transcript.status = "completed"
         mock_transcript.id = "test-id-123"
@@ -120,13 +120,14 @@ class TestRunTranscription:
 
         with patch("transcribeone.aai.Transcriber") as MockT:
             MockT.return_value.transcribe.return_value = mock_transcript
-            tid, results = transcribeone.run_transcription("test.mp3")
+            tid, results, chapters = transcribeone.run_transcription("test.mp3")
 
         assert tid == "test-id-123"
         assert results == [("A", "Hello."), ("B", "Hi.")]
+        assert chapters is None
 
     def test_no_speech_returns_empty(self):
-        """Empty utterances returns (id, [])."""
+        """Empty utterances returns (id, [], None)."""
         mock_transcript = MagicMock()
         mock_transcript.status = "completed"
         mock_transcript.id = "test-id"
@@ -134,10 +135,52 @@ class TestRunTranscription:
 
         with patch("transcribeone.aai.Transcriber") as MockT:
             MockT.return_value.transcribe.return_value = mock_transcript
-            tid, results = transcribeone.run_transcription("test.mp3")
+            tid, results, chapters = transcribeone.run_transcription("test.mp3")
 
         assert tid == "test-id"
         assert results == []
+        assert chapters is None
+
+    def test_word_boost_passed_to_config(self):
+        """word_boost is passed through to TranscriptionConfig."""
+        mock_transcript = MagicMock()
+        mock_transcript.status = "completed"
+        mock_transcript.id = "test-id"
+        mock_transcript.utterances = []
+
+        with patch("transcribeone.aai.Transcriber") as MockT, \
+             patch("transcribeone.aai.TranscriptionConfig") as MockConfig:
+            MockT.return_value.transcribe.return_value = mock_transcript
+            transcribeone.run_transcription("test.mp3", word_boost=["Alice", "Bob"])
+
+        MockConfig.assert_called_once_with(speaker_labels=True, word_boost=["Alice", "Bob"])
+
+    def test_auto_chapters_returns_chapters(self):
+        """auto_chapters=True returns parsed chapter data."""
+        mock_chapter = MagicMock()
+        mock_chapter.headline = "Introduction"
+        mock_chapter.summary = "The hosts introduce the topic."
+        mock_chapter.gist = "intro"
+        mock_chapter.start = 0
+        mock_chapter.end = 60000
+
+        mock_transcript = MagicMock()
+        mock_transcript.status = "completed"
+        mock_transcript.id = "test-id"
+        mock_transcript.utterances = [self._make_utterance("A", "Hello.")]
+        mock_transcript.chapters = [mock_chapter]
+
+        with patch("transcribeone.aai.Transcriber") as MockT:
+            MockT.return_value.transcribe.return_value = mock_transcript
+            tid, results, chapters = transcribeone.run_transcription(
+                "test.mp3", auto_chapters=True,
+            )
+
+        assert chapters is not None
+        assert len(chapters) == 1
+        assert chapters[0]["headline"] == "Introduction"
+        assert chapters[0]["start"] == 0
+        assert chapters[0]["end"] == 60000
 
     def test_error_raises_transcribe_error(self):
         """API error raises TranscribeError."""

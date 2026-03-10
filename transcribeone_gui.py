@@ -194,6 +194,11 @@ class TranscribeOneApp:
         self.root.minsize(520, 700)
         self.root.configure(bg=CLR_BG)
 
+        # Grab focus when the mouse enters the window so that button
+        # clicks register immediately (macOS otherwise requires one click
+        # to activate the window before controls respond).
+        self.root.bind("<Enter>", lambda e: self.root.focus_force())
+
         # State
         self._api_key_var = tk.StringVar()
         self._audio_path_var = tk.StringVar()
@@ -215,6 +220,7 @@ class TranscribeOneApp:
         # Transcript state
         self._current_audio_file: str = ""
         self._raw_results: list[tuple[str, str]] = []
+        self._chapters: list[dict] | None = None
         self._speaker_name_vars: dict[str, tk.StringVar] = {}
 
         # Show Notes Generator state
@@ -568,6 +574,19 @@ class TranscribeOneApp:
         ttk.Label(
             names_content,
             text="Enter expected speaker names separated by commas (e.g. Alice, Bob)",
+            style="CardMuted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+        # --- Word Boost ---
+        boost_content = self._create_section(self._scroll_frame, "\U0001F4AC", "Word Boost (optional)")
+
+        self._word_boost_var = tk.StringVar()
+        boost_entry = ttk.Entry(boost_content, textvariable=self._word_boost_var)
+        boost_entry.pack(fill="x")
+
+        ttk.Label(
+            boost_content,
+            text="Boost recognition of specific words (e.g. character names, places)",
             style="CardMuted.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1349,6 +1368,10 @@ class TranscribeOneApp:
             raw_names = self._speaker_names_var.get().strip()
             speaker_names = [n.strip() for n in raw_names.split(",") if n.strip()] if raw_names else []
 
+            # Parse word boost
+            raw_boost = self._word_boost_var.get().strip()
+            word_boost = [w.strip() for w in raw_boost.split(",") if w.strip()] if raw_boost else None
+
             # Lock UI
             self._transcribing = True
             self._set_ui_busy(True)
@@ -1361,7 +1384,7 @@ class TranscribeOneApp:
 
             thread = threading.Thread(
                 target=self._transcription_worker,
-                args=(audio_file, api_key, speaker_names, is_video),
+                args=(audio_file, api_key, speaker_names, is_video, word_boost),
                 daemon=True,
             )
             thread.start()
@@ -1371,7 +1394,7 @@ class TranscribeOneApp:
             self._transcribing = False
             self._set_ui_busy(False)
 
-    def _transcription_worker(self, audio_file: str, api_key: str, speaker_names: list[str], is_video: bool = False) -> None:
+    def _transcription_worker(self, audio_file: str, api_key: str, speaker_names: list[str], is_video: bool = False, word_boost: list[str] | None = None) -> None:
         """Run transcription in a background thread. Must NOT touch tkinter."""
         import transcribeone  # deferred — pulls in assemblyai (heavy)
 
@@ -1386,7 +1409,9 @@ class TranscribeOneApp:
                 self.root.after(0, self._status_var.set, "Uploading and transcribing\u2026")
 
             transcribeone.set_api_key(api_key)
-            transcript_id, results = transcribeone.run_transcription(actual_audio)
+            transcript_id, results, chapters = transcribeone.run_transcription(
+                actual_audio, word_boost=word_boost, auto_chapters=True,
+            )
 
             speakers_identified = False
             if results and speaker_names:
@@ -1401,7 +1426,7 @@ class TranscribeOneApp:
                     speakers_identified = True
 
             # Use original file path for display/save purposes
-            self.root.after(0, self._on_transcription_complete, audio_file, results, speakers_identified)
+            self.root.after(0, self._on_transcription_complete, audio_file, results, speakers_identified, chapters)
         except Exception as exc:
             self.root.after(0, self._on_transcription_error, str(exc))
 
@@ -1416,13 +1441,14 @@ class TranscribeOneApp:
             return label
         return f"SPEAKER {label}"
 
-    def _on_transcription_complete(self, audio_file: str, results: list[tuple[str, str]], speakers_identified: bool = False) -> None:
+    def _on_transcription_complete(self, audio_file: str, results: list[tuple[str, str]], speakers_identified: bool = False, chapters: list[dict] | None = None) -> None:
         """Display results and auto-save (called on main thread)."""
         self._progress.stop()
         self._set_ui_busy(False)
         self._transcribing = False
         self._current_audio_file = audio_file
         self._raw_results = results
+        self._chapters = chapters
 
         # Show rename panel when we have generic labels
         if results and not speakers_identified:
@@ -1490,23 +1516,48 @@ class TranscribeOneApp:
                 return name
         return self._format_speaker(label, identified)
 
+    @staticmethod
+    def _format_ms_timestamp(ms: int) -> str:
+        """Convert milliseconds to MM:SS format."""
+        total_seconds = ms // 1000
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes}:{seconds:02d}"
+
     def _render_transcript(self, speakers_identified: bool = False) -> None:
         """Render the transcript text using current speaker names.
 
         A blank line is inserted between consecutive lines from different
-        speakers to make the transcript easier to read.
+        speakers to make the transcript easier to read.  If chapters were
+        detected, they are prepended as a summary block.
         """
+        parts: list[str] = []
+
+        # Prepend chapters if available
+        chapters = getattr(self, "_chapters", None)
+        if chapters:
+            parts.append("CHAPTERS")
+            parts.append("=" * 40)
+            for i, ch in enumerate(chapters, 1):
+                start = self._format_ms_timestamp(ch["start"])
+                end = self._format_ms_timestamp(ch["end"])
+                parts.append(f"Chapter {i}: {ch['headline']} ({start} \u2013 {end})")
+                parts.append(f"  {ch['summary']}")
+                parts.append("")
+            parts.append("=" * 40)
+            parts.append("")
+
         if not self._raw_results:
-            text = "No speech detected."
+            parts.append("No speech detected.")
         else:
-            parts: list[str] = []
             prev_speaker: str | None = None
             for speaker, utt in self._raw_results:
                 if prev_speaker is not None and speaker != prev_speaker:
                     parts.append("")          # blank separator line
                 parts.append(f"{self._get_speaker_display(speaker, speakers_identified)}: {utt}")
                 prev_speaker = speaker
-            text = "\n".join(parts)
+
+        text = "\n".join(parts)
 
         self._result_text.configure(state="normal")
         self._result_text.delete("1.0", "end")
